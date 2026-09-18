@@ -9,39 +9,53 @@ import (
 // Queue is a concurrent, generic FIFO queue.
 //
 // A Queue supports multiple concurrent producers and consumers.
-// Push adds an item to the queue, while Pop waits until an item is
-// available or the queue is closed.
+// Push adds values to the queue, while Pop waits for and returns
+// the next available value.
 //
-// The queue is unbounded and Push does not block waiting for a consumer.
+// Values are delivered in FIFO order. When multiple consumers are
+// waiting, each value is delivered to exactly one consumer.
 //
-// Calling Close stops the queue and causes blocked or subsequent
-// Push and Pop operations to return an error. Items that have not
-// yet been delivered when Close is called may be discarded.
+// The queue is unbounded and does not apply backpressure to producers.
+// Push only blocks briefly while synchronizing access to the queue's
+// internal state.
 //
-// A Queue must not be copied after its first use.
+// A Queue must be closed when it is no longer needed. Closing the
+// queue releases its background processing goroutine and unblocks
+// pending Pop calls.
 type Queue[T any] interface {
-	// Push adds input to the queue.
+	// Push adds a value to the back of the queue.
 	//
-	// Push returns an error if the queue has already been closed.
-	// Push is safe to call concurrently.
+	// Push is safe to call concurrently with other Push, Pop, and Close
+	// operations. It returns an error if the queue has already been closed.
 	Push(T) error
 
-	// Pop removes and returns the next available item from the queue.
+	// Pop returns a channel that receives the next available value.
 	//
-	// Pop blocks while the queue is empty. It returns an error when
-	// the queue is closed.
+	// If the queue is empty, Pop waits until a value becomes available
+	// or the queue is closed. The returned channel is closed when the
+	// queue is closed before a value can be delivered.
 	//
-	// Pop is safe to call concurrently.
-	Pop() (T, error)
+	// Each queued value is delivered to at most one Pop call.
+	Pop() <-chan T
 
-	// Close stops the queue.
+	// Close closes the queue and waits for its background processing
+	// goroutine to exit.
 	//
-	// Close is safe to call concurrently and may be called multiple
-	// times. Pending items may not be delivered after Close returns.
+	// After Close returns, Push returns an error and no new values can
+	// be added. Pending Pop calls are unblocked and their returned
+	// channels are closed if no value has already been delivered.
+	//
+	// Values that have not yet been delivered when the queue is closed
+	// may be discarded.
+	//
+	// Close is safe to call multiple times and concurrently.
 	Close()
 }
 
-// New creates a new concurrent queue for values of type T.
+// New creates and starts a new concurrent FIFO queue for values of type T.
+//
+// The returned queue is ready for concurrent use by multiple producers
+// and consumers.
 func New[T any]() Queue[T] {
 	return newQueue[T]()
 }
@@ -108,15 +122,20 @@ func (q *queue[T]) loop() {
 	}
 }
 
-func (q *queue[T]) Pop() (T, error) {
-	select {
-	case <-q.ctx.Done():
-		var zero T
-		err := q.ctx.Err()
-		return zero, fmt.Errorf("q.ctx.Err: %w", err)
-	case value := <-q.subCh:
-		return value, nil
-	}
+func (q *queue[T]) Pop() <-chan T {
+	ch := make(chan T, 1)
+	go func() {
+		defer close(ch)
+		select {
+		case <-q.ctx.Done():
+		case value, ok := <-q.subCh:
+			if !ok {
+				return
+			}
+			ch <- value
+		}
+	}()
+	return ch
 }
 
 func (q *queue[T]) Close() {
