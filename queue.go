@@ -108,6 +108,10 @@ func (q *queue[T]) loop() {
 			return
 		case <-q.sigCh:
 			q.mu.Lock()
+			if len(q.store) == 0 {
+				q.mu.Unlock()
+				continue
+			}
 			values := q.store
 			q.store = []T{}
 			q.mu.Unlock()
